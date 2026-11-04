@@ -231,29 +231,63 @@ def semantic_search(query: str, k: int, root: Path, cfg: dict):
 # ---------------------------------------------------------------- 行号回贴
 
 ANCHOR_MIN = 14
+# 定位分级（v1.2）：exact = 「这一行就是那句话」；coarse = 「这句话在这个小节里」。
+# 两种声称强度不同，不能用同一个测试 —— 混测要么假红（拿弱声称过强断言），要么假绿。
+COARSE_MIN_FRAG = 8   # 碎片下限：低于 8 字会命中全篇任意一行
+COARSE_MIN_HITS = 2   # 至少命中 2 片；单片则要求该片 ≥12 字
 
 
-def locate_line(p: Path, snippet: str):
-    """把 chunk 级 snippet 落回文件真实行号；定位不到返回 None（不猜）。
-
-    这一步是语义通道能用的前提：引擎只给 rel_path + chunk，而本技能的硬契约是
-    「依据＝路径:行号」。没有回贴，整个可溯源机制就退化。
+def _anchors(snippet: str):
+    """可当**严格锚点**的长片段，长片段优先。
 
     ⚠️ 短片段不能当锚点：「2026-10-12」这类会命中整表任意一行（实测 32 条里 12 条贴错）。
-    故锚点下限 ANCHOR_MIN，且长片段优先、长度逐级降。
     """
-    try:
-        raw = p.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return None
-
     core = (snippet or "").replace("…", " ")
     cells = [x.strip() for x in re.split(r"[|｜•]", core)]
-    cells = sorted([x for x in cells if len(x) >= ANCHOR_MIN], key=len, reverse=True)
-    if not cells:
-        whole = core.strip()
-        cells = [whole] if len(whole) >= ANCHOR_MIN else []
+    return sorted([x for x in cells if len(x) >= ANCHOR_MIN], key=len, reverse=True)
 
+
+def _fragments(snippet: str):
+    """粗定位用的碎片：**连空白一起切**。
+
+    chunk 边界会把一行劈成两半，劈开处常被序列化成空格或换行 ——
+    「跨行的那一片」在文件里根本不存在，严格锚点必然落空。
+    按空白切开后，每一片通常仍完整落在单个文件行内。
+    """
+    core = (snippet or "").replace("…", " ")
+    parts = [x.strip() for x in re.split(r"[|｜•\s]+", core)]
+    return [x for x in parts if len(x) >= COARSE_MIN_FRAG]
+
+
+def _section_range(raw, heading: str):
+    """heading 所在小节的 1-based 闭区间 [start, end]；找不到返回 None。
+
+    小节定义：命中的标题行起，到下一个**同级或更高级**标题的前一行止。
+    """
+    if not heading:
+        return None
+    leaf = str(heading).split(">")[-1].strip()
+    if len(leaf) < 4:
+        return None
+    start, level = None, 0
+    for i, line in enumerate(raw, 1):
+        m = re.match(r"^(#{1,6})\s", line.lstrip())
+        if not m:
+            continue
+        if start is None:
+            if leaf in line:
+                start, level = i, len(m.group(1))
+            continue
+        if len(m.group(1)) <= level:
+            return (start, i - 1)
+    return (start, len(raw)) if start else None
+
+
+def _match_exact(raw, snippet: str):
+    cells = _anchors(snippet)
+    if not cells:
+        whole = (snippet or "").replace("…", " ").strip()
+        cells = [whole] if len(whole) >= ANCHOR_MIN else []
     for cell in cells:
         for n in (32, 24, 18, ANCHOR_MIN):
             needle = cell[:n]
@@ -265,21 +299,70 @@ def locate_line(p: Path, snippet: str):
     return None
 
 
-def locate_heading(p: Path, heading: str):
-    """snippet 定位失败时的兜底：按 chunk 的小节标题定位到标题行。"""
+def _match_coarse(raw, snippet: str, heading: str):
+    """在 chunk 声明的小节内找最像的那一行。
+
+    限制在小节内是这道兜底能被接受的**唯一**理由：没有这道闸，粗定位会满篇乱跳，
+    而一个跳到别处的行号比「定位失败」更糟 —— 失败是诚实的，错行号会被当依据引用。
+    """
+    rng = _section_range(raw, heading)
+    if not rng:
+        return None
+    lo, hi = rng
+    frags = _fragments(snippet)
+    if not frags:
+        return None
+    best, best_n = None, 0
+    for i in range(lo, min(hi, len(raw)) + 1):
+        line = raw[i - 1]
+        n = sum(1 for f in frags if f in line)
+        if n > best_n:
+            best, best_n = i, n
+    if best is None:
+        return None
+    if best_n >= COARSE_MIN_HITS:
+        return best
+    if best_n == 1:  # 单片也可以，但那一片必须够长
+        for f in frags:
+            if len(f) >= 12 and f in raw[best - 1]:
+                return best
+    return None
+
+
+def _match_heading(raw, heading: str):
     if not heading:
         return None
     leaf = str(heading).split(">")[-1].strip()
     if len(leaf) < 4:
         return None
-    try:
-        raw = p.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return None
     for i, line in enumerate(raw, 1):
         if leaf in line and line.lstrip().startswith("#"):
             return i
     return None
+
+
+def locate(p: Path, snippet: str, heading: str = ""):
+    """把 chunk 级 snippet 落回真实行号，并返回定位分级 (line, loc)。
+
+    定位不到返回 (None, None) —— 不猜。这一步是语义通道能用的前提：
+    引擎只给 rel_path + chunk，而本技能的硬契约是「依据＝路径:行号」。
+    没有回贴，整个可溯源机制就退化。
+    """
+    try:
+        raw = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None, None
+
+    ln = _match_exact(raw, snippet)
+    if ln is not None:
+        return ln, "exact"
+    ln = _match_coarse(raw, snippet, heading)
+    if ln is not None:
+        return ln, "coarse"
+    ln = _match_heading(raw, heading)
+    if ln is not None:
+        return ln, "coarse"
+    return None, None
 
 
 # ---------------------------------------------------------------- 分词与打分
@@ -418,6 +501,7 @@ def cmd_probe(args, cfg):
             for s in sorted(best, reverse=True):
                 for ln, line in best[s]:
                     hits.append({"layer": name, "path": rel_to(p, root), "line": ln,
+                                 "loc": "exact",  # 字面命中的 text 就是该行内容，恒为精确
                                  "score": round(s * weight, 2), "text": line[:args.excerpt]})
 
     hits.sort(key=lambda h: (-h["score"], h["path"], h["line"]))
@@ -469,13 +553,11 @@ def cmd_probe(args, cfg):
                 sp = root / rel
                 if not rel or not sp.is_file():
                     continue
-                ln = locate_line(sp, h.get("snippet", ""))
-                if ln is None:
-                    ln = locate_heading(sp, h.get("heading", ""))
+                ln, loc = locate(sp, h.get("snippet", ""), h.get("heading", ""))
                 if ln is None or (rel, ln) in lex_keys:
                     continue
                 sem_hits.append({
-                    "layer": "语义", "path": rel, "line": ln,
+                    "layer": "语义", "path": rel, "line": ln, "loc": loc,
                     "score": round(float(h.get("score") or 0), 4),
                     "text": (h.get("snippet") or "").replace("\n", " ")[:args.excerpt],
                     "src": "语义", "heading": h.get("heading", ""),
@@ -535,10 +617,13 @@ def cmd_probe(args, cfg):
               f"{sem_meta.get('top1_cosine')} / 拒答阈值 {sem_meta.get('threshold')}，"
               f"no_answer={sem_meta.get('no_answer')}）")
         for h in sem_hits:
-            print(f"[{h['score']:>6}] 语义 | {h['path']}:{h['line']}")
+            mark = "（粗）" if h.get("loc") == "coarse" else ""
+            print(f"[{h['score']:>6}] 语义 | {h['path']}:{h['line']}{mark}")
             print(f"         {h['text']}")
         if not sem_hits:
             print("         （语义命中与字面重合，或行号定位失败）")
+        if any(h.get("loc") == "coarse" for h in sem_hits):
+            print("         ⚠️ 标「（粗）」的只保证落在该小节内，不保证同一句 —— 引用时须核对原文。")
 
     print("\n用法提醒：引用时写 `[记忆] 路径:行号`；上面没有的，一律标 `[推断]`。")
     return 0
@@ -660,10 +745,18 @@ def cmd_selftest(args, cfg):
         print(f"{'PASS' if ok else 'FAIL'}  可用性 -> no_answer 布尔 + top1_cosine 均返回")
         failures += 0 if ok else 1
 
-        # 反向包含：定位到的真实行，回查是否真在引擎给的 chunk 快照里。
-        # 判据取「整行任一 12 字窗口出现在快照中」而非「行首 12 字」——
-        # 快照是从行中间截的，行首常落在窗口外（初版就是这么误判成 BAD 的）。
+        # 分级断言。两类声称强度不同，必须分开测：
+        #   exact  → 「这一行就是那句话」：整行任一 12 字窗口须出现在 chunk 快照中
+        #   coarse → 「这一行在该小节内」：须落在 chunk 声明的小节行区间里
+        # 混测会同时犯两种错：拿弱声称过强断言（假红），或放宽断言迁就弱声称（假绿）。
+        missing = [h for h in all_sem if h.get("loc") not in ("exact", "coarse")]
+        ok = not missing
+        print(f"{'PASS' if ok else 'FAIL'}  定位分级字段 -> 每条语义命中都带 loc∈{{exact,coarse}}"
+              f"（缺 {len(missing)} 条）")
+        failures += 0 if ok else 1
+
         good = badn = 0
+        c_good = c_bad = 0
         for h in all_sem:
             try:
                 real = (root / h["path"]).read_text(encoding="utf-8", errors="replace").splitlines()
@@ -673,6 +766,14 @@ def cmd_selftest(args, cfg):
             n = h["line"]
             if n < 1 or n > len(real):
                 badn += 1
+                continue
+            if h.get("loc") == "coarse":
+                rng = _section_range(real, h.get("heading", ""))
+                if rng and rng[0] <= n <= rng[1]:
+                    c_good += 1
+                else:
+                    c_bad += 1
+                    print(f"       BAD  {h['path']}:{n} 标了粗定位却不在声明小节内")
                 continue
             line_n = re.sub(r"[`*|#>\-\s]", "", real[n - 1])
             snip = re.sub(r"[`*|#>\-\s]", "", h["text"])
@@ -687,20 +788,29 @@ def cmd_selftest(args, cfg):
                 good += 1
             else:
                 badn += 1
-                print(f"       BAD  {h['path']}:{n} 定位行内容不在 chunk 快照内")
+                print(f"       BAD  {h['path']}:{n} 精确定位行内容不在 chunk 快照内")
+
         total_sem = good + badn
         ratio = (good / total_sem) if total_sem else 0
+        # 分母**只含 exact**。若命中全退化成 coarse，分母归零 → 直接 FAIL；
+        # 没有这一条，把全部命中都标成「粗」就能让这条断言永远通过。
         ok = total_sem > 0 and ratio >= 0.9
-        print(f"{'PASS' if ok else 'FAIL'}  行号回贴保真 -> {good}/{total_sem} 条定位行可在 chunk 快照中反查到")
+        print(f"{'PASS' if ok else 'FAIL'}  精确回贴保真 -> {good}/{total_sem} 条 exact 定位行可在 chunk 快照中反查到")
+        failures += 0 if ok else 1
+
+        c_total = c_good + c_bad
+        ok = c_bad == 0
+        print(f"{'PASS' if ok else 'FAIL'}  粗定位不越界 -> {c_good}/{c_total} 条 coarse 命中落在声明小节内"
+              f"（coarse 占比 {c_total}/{len(all_sem)}）")
         failures += 0 if ok else 1
 
     if sem_status == "SKIP":
         print("SKIP  语义通道未检测 —— 未检测不等于通过")
 
     total = (len(positives) + len(negatives) + 1
-             + (len(syn) + 2 if sem_status == "RUN" else 0))
+             + (len(syn) + 4 if sem_status == "RUN" else 0))
     print(f"\n结果: {total - failures}/{total} 通过"
-          + ("" if sem_status == "RUN" else f"（语义段 SKIP，分母不含 {len(syn) + 2} 条）"))
+          + ("" if sem_status == "RUN" else f"（语义段 SKIP，分母不含 {len(syn) + 4} 条）"))
     return 0 if failures == 0 else 1
 
 
