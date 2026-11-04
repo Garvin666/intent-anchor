@@ -1,0 +1,55 @@
+{
+  "_comment": "复制成 memory_probe.config.json 后改路径即可。相对路径以本文件所在目录为基准。",
+  "kb_root": "~/my-knowledge-base",
+
+  "layers": [
+    {
+      "name": "画像",
+      "weight": 1.5,
+      "glob": "memory/profile/*.md",
+      "_why": "稳定偏好与做事方式。权重最高，因为它比流水日志更权威"
+    },
+    {
+      "name": "经验沉淀",
+      "weight": 1.3,
+      "glob": "memory/lessons/**/*.md",
+      "_why": "踩过的坑与可复用结论"
+    },
+    {
+      "name": "纠错账本",
+      "weight": 1.3,
+      "glob": "memory/corrections.md",
+      "_why": "同类偏差的复发记录，直接影响「会踩的坑」栏"
+    },
+    {
+      "name": "交接",
+      "weight": 1.0,
+      "glob": "memory/handoffs/**/*.md",
+      "_why": "任务级交接记录"
+    },
+    {
+      "name": "会话记忆",
+      "weight": 1.0,
+      "glob": "memory/sessions/**/*.md",
+      "_why": "逐次会话的笔记，量最大，只检索不整读"
+    }
+  ],
+
+  "resident": {
+    "_why": "每次开工都要读的那一小撮。总行数控制在 500–700 行以内，超了说明该压缩记忆本身",
+    "files": [
+      "memory/profile/working-style.md"
+    ],
+    "ledger": "memory/corrections.md"
+  },
+
+  "semantic": {
+    "_why": "可选。接一个已有的本地检索引擎，不要为本工具重建向量索引。留 enabled=false 就只跑字面通道",
+    "enabled": false,
+    "python": "",
+    "module": "your_engine",
+    "module_home": "",
+    "zone": "",
+    "timeout": 30
+  }
+}
