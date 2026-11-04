@@ -1,0 +1,13 @@
+{
+  "kb_root": ".",
+  "layers": [
+    {"name": "画像", "weight": 1.5, "glob": "memory/profile/*.md"},
+    {"name": "交接", "weight": 1.0, "glob": "memory/handoffs/**/*.md"}
+  ],
+  "resident": {
+    "files": ["memory/profile/working-style.md"]
+  },
+  "semantic": {
+    "enabled": false
+  }
+}
